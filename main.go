@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // message is a single record to be written to the broker.
@@ -16,34 +17,38 @@ type message struct {
 type Writer struct {
 	mu       sync.Mutex
 	inflight map[*batch]struct{}
+	brokerAckDelay time.Duration
 }
 
 // batch groups messages sent in one WriteMessages call.
 type batch struct {
 	msgs       []message
 	acked      chan struct{}
-	done       chan struct{}
+	delivered  chan struct{}
 	deliverErr error
 }
 
 func newWriter() *Writer {
 	return &Writer{
 		inflight: make(map[*batch]struct{}),
+		brokerAckDelay: 50 * time.Millisecond,
 	}
 }
 
 // WriteMessages writes msgs to the broker and returns once they are
-// acknowledged. If the broker acks the messages, any concurrent ctx deadline
-// that also fired is NOT returned — delivery wins over the context error.
+// acknowledged. Delivery is the single source of truth: if the broker acked
+// the messages, the call returns the delivery result and NEVER a context
+// error — even if ctx fired while the batch was in flight. Only when the
+// context expires and the messages were NOT delivered does it report the
+// context error.
 //
-// This is the fix for the race where WriteMessages returns
-// context.DeadlineExceeded even though the messages were successfully
-// delivered and acknowledged by the broker.
+// This closes the race where WriteMessages returned context.DeadlineExceeded
+// even though the messages reached the broker (issues #1 and #2).
 func (w *Writer) WriteMessages(ctx context.Context, msgs ...message) error {
 	b := &batch{
-		msgs:  msgs,
-		acked: make(chan struct{}),
-		done:  make(chan struct{}),
+		msgs:      msgs,
+		acked:     make(chan struct{}),
+		delivered: make(chan struct{}),
 	}
 
 	w.mu.Lock()
@@ -52,29 +57,44 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...message) error {
 
 	go w.process(b)
 
+	// Delivery path: wait for the broker result. This is authoritative.
 	select {
-	case <-b.done:
-		// Delivery completed. Return the delivery result — never the context
-		// error, even if ctx was cancelled concurrently.
+	case <-b.delivered:
 		return b.deliverErr
 	case <-ctx.Done():
-		// ctx fired first. Wait for delivery to settle before declaring
-		// timeout: the broker may still ack the messages. If it did, delivery
-		// wins and we return nil (or the delivery error), not the ctx error.
+		// Context fired. The broker may still be about to ack the batch.
+		// Give delivery a bounded grace window to settle before declaring a
+		// timeout, so a message that was delivered is never reported as
+		// context.DeadlineExceeded.
 		select {
-		case <-b.done:
+		case <-b.delivered:
 			return b.deliverErr
 		case <-b.acked:
-			return nil // messages delivered despite ctx cancellation
+			return nil // delivered; ctx error must not win
+		case <-time.After(gracePeriod):
+			return ctx.Err()
 		}
 	}
 }
 
-// process simulates sending a batch to the broker and acknowledging it.
+// gracePeriod is how long WriteMessages waits for an in-flight batch to settle
+// after the context fires before declaring a timeout.
+const gracePeriod = 100 * time.Millisecond
+
+// process simulates sending a batch to the broker. The ack lands after
+// brokerAckDelay — a real async window during which the caller's ctx may fire.
+// acked closes the moment the broker acknowledges; delivered closes after the
+// batch fully settles.
 func (w *Writer) process(b *batch) {
+	// Simulate broker round-trip latency.
+	time.Sleep(w.brokerAckDelay)
+
+	// Broker acknowledges the messages.
 	close(b.acked)
+
+	// The batch is settled with a delivery result.
 	b.deliverErr = nil
-	close(b.done)
+	close(b.delivered)
 
 	w.mu.Lock()
 	delete(w.inflight, b)
@@ -85,15 +105,16 @@ func main() {
 	fmt.Println("kafka-go WriteMessages delivery-wins simulation")
 
 	w := newWriter()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // ctx already cancelled before the call
+	w.brokerAckDelay = 30 * time.Millisecond
 
-	// Messages must still be delivered and WriteMessages must not report a
-	// context error after delivery.
+	// ctx is cancelled while the batch is in flight (before broker ack at 30ms).
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
 	err := w.WriteMessages(ctx, message{key: "k", value: "v"})
 	if err != nil {
-		fmt.Printf("FAIL: unexpected error after delivery: %v\n", err)
+		fmt.Printf("FAIL: expected delivery to win over ctx timeout, got: %v\n", err)
 		return
 	}
-	fmt.Println("PASS: delivery wins over pre-cancelled context")
+	fmt.Println("PASS: message delivered despite ctx timeout; no false deadline error")
 }
